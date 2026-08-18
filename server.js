@@ -1,118 +1,77 @@
-const path = require("path");
-const http = require("http");
-const express = require("express");
-const { Server } = require("socket.io");
+const path=require("path");
+const http=require("http");
+const express=require("express");
+const {Server}=require("socket.io");
+const app=express(), server=http.createServer(app), io=new Server(server);
+app.use(express.static(path.join(__dirname,"public")));
+const rooms=new Map();
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-
-app.use(express.static(path.join(__dirname, "public")));
-
-const rooms = new Map();
-
-function makeRoomCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code;
-  do {
-    code = Array.from({length: 6}, () => chars[Math.floor(Math.random()*chars.length)]).join("");
-  } while (rooms.has(code));
-  return code;
+function code(){
+  const c="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; let s;
+  do{s=Array.from({length:6},()=>c[Math.floor(Math.random()*c.length)]).join("")}while(rooms.has(s));
+  return s;
 }
+function safeName(n,f){return String(n||f).trim().slice(0,20)||f}
+function state(r){return {
+  code:r.code, hostId:r.hostId, players:[...r.players.values()],
+  started:r.started, puzzle:r.puzzle, board:r.board, solution:r.solution,
+  scores:r.scores, difficulty:r.difficulty, startTime:r.startTime,
+  finished:r.finished, winnerId:r.winnerId, chat:r.chat.slice(-50)
+}}
+function emit(r){io.to(r.code).emit("room:update",state(r))}
+function solved(r){return r.started && r.board && r.board.every((v,i)=>v===r.solution[i])}
 
-function broadcastRoom(roomCode) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  io.to(roomCode).emit("room:update", {
-    players: [...room.players.values()].map(p => ({id:p.id, name:p.name, color:p.color})),
-    hostId: room.hostId,
-    started: room.started,
-    puzzle: room.puzzle,
-    solution: room.solution,
-    board: room.board,
-    scores: room.scores
+io.on("connection",s=>{
+  s.on("room:create",({name},cb)=>{
+    const c=code(), p={id:s.id,name:safeName(name,"Player 1"),slot:1,color:"green"};
+    const r={code:c,players:new Map([[s.id,p]]),hostId:s.id,started:false,puzzle:null,board:null,solution:null,
+      scores:{[s.id]:0},difficulty:"medium",startTime:null,finished:false,winnerId:null,chat:[]};
+    rooms.set(c,r); s.join(c); s.data.room=c; cb({ok:true,code:c}); emit(r);
   });
-}
-
-io.on("connection", socket => {
-  socket.on("room:create", ({name}, cb) => {
-    const code = makeRoomCode();
-    const player = {id: socket.id, name: String(name || "Player 1").slice(0,20), color:"#2563eb"};
-    rooms.set(code, {
-      players: new Map([[socket.id, player]]),
-      hostId: socket.id,
-      started: false,
-      puzzle: null,
-      solution: null,
-      board: null,
-      scores: {[socket.id]: 0}
-    });
-    socket.join(code);
-    socket.data.room = code;
-    cb({ok:true, code});
-    broadcastRoom(code);
+  s.on("room:join",({code:raw,name},cb)=>{
+    const c=String(raw||"").trim().toUpperCase(), r=rooms.get(c);
+    if(!r)return cb({ok:false,error:"Private room not found."});
+    if(r.players.size>=2)return cb({ok:false,error:"This private room is full."});
+    const p={id:s.id,name:safeName(name,"Player 2"),slot:2,color:"red"};
+    r.players.set(s.id,p); r.scores[s.id]=0; s.join(c); s.data.room=c; cb({ok:true,code:c}); emit(r);
   });
-
-  socket.on("room:join", ({code,name}, cb) => {
-    code = String(code || "").trim().toUpperCase();
-    const room = rooms.get(code);
-    if (!room) return cb({ok:false,error:"Room not found."});
-    if (room.players.size >= 2) return cb({ok:false,error:"This room already has two players."});
-    const player = {id: socket.id, name: String(name || "Player 2").slice(0,20), color:"#dc2626"};
-    room.players.set(socket.id, player);
-    room.scores[socket.id] = 0;
-    socket.join(code);
-    socket.data.room = code;
-    cb({ok:true, code});
-    broadcastRoom(code);
+  s.on("game:start",({puzzle,solution,difficulty})=>{
+    const r=rooms.get(s.data.room); if(!r||r.hostId!==s.id||r.players.size!==2)return;
+    r.started=true;r.puzzle=puzzle;r.board=puzzle.slice();r.solution=solution;r.difficulty=difficulty||"medium";
+    r.startTime=Date.now();r.finished=false;r.winnerId=null;
+    for(const id of r.players.keys())r.scores[id]=0; emit(r);
   });
-
-  socket.on("game:start", ({puzzle,solution}) => {
-    const code = socket.data.room, room = rooms.get(code);
-    if (!room || room.hostId !== socket.id || room.players.size < 2) return;
-    room.started = true;
-    room.puzzle = puzzle;
-    room.solution = solution;
-    room.board = puzzle.slice();
-    for (const id of Object.keys(room.scores)) room.scores[id] = 0;
-    broadcastRoom(code);
-  });
-
-  socket.on("game:move", ({index,value}) => {
-    const code = socket.data.room, room = rooms.get(code);
-    if (!room || !room.started || !Number.isInteger(index) || index<0 || index>80) return;
-    value = Number(value);
-    if (value < 0 || value > 9) return;
-    // Only empty cells can be changed; correct entries earn a point.
-    if (room.puzzle[index] !== 0) return;
-    room.board[index] = value;
-    if (value === room.solution[index]) room.scores[socket.id] += 1;
-    broadcastRoom(code);
-  });
-
-  socket.on("game:reset", () => {
-    const code = socket.data.room, room = rooms.get(code);
-    if (!room || room.hostId !== socket.id || !room.started) return;
-    room.board = room.puzzle.slice();
-    for (const id of Object.keys(room.scores)) room.scores[id] = 0;
-    broadcastRoom(code);
-  });
-
-  socket.on("disconnect", () => {
-    const code = socket.data.room;
-    if (!code || !rooms.has(code)) return;
-    const room = rooms.get(code);
-    room.players.delete(socket.id);
-    delete room.scores[socket.id];
-    if (room.players.size === 0) rooms.delete(code);
-    else {
-      room.hostId = [...room.players.keys()][0];
-      room.started = false;
-      room.puzzle = room.solution = room.board = null;
-      broadcastRoom(code);
+  s.on("game:move",({index,value})=>{
+    const r=rooms.get(s.data.room); if(!r||!r.started||r.finished)return;
+    if(!Number.isInteger(index)||index<0||index>80||r.puzzle[index]!==0)return;
+    value=Number(value); if(value<0||value>9)return;
+    const before=r.board[index], correct=value===r.solution[index];
+    r.board[index]=value;
+    if(correct && before!==r.solution[index])r.scores[s.id]=(r.scores[s.id]||0)+1;
+    if(solved(r)){
+      r.finished=true;
+      const ranked=[...r.players.values()].sort((a,b)=>(r.scores[b.id]||0)-(r.scores[a.id]||0));
+      r.winnerId=ranked[0].id;
     }
+    emit(r);
+  });
+  s.on("chat:send",({text})=>{
+    const r=rooms.get(s.data.room), p=r?.players.get(s.id); if(!r||!p)return;
+    text=String(text||"").trim().slice(0,200); if(!text)return;
+    r.chat.push({id:Date.now()+"-"+Math.random(),playerId:s.id,name:p.name,slot:p.slot,text,time:Date.now()}); emit(r);
+  });
+  s.on("game:rematch",({puzzle,solution,difficulty})=>{
+    const r=rooms.get(s.data.room); if(!r||r.hostId!==s.id||r.players.size!==2)return;
+    r.started=true;r.puzzle=puzzle;r.board=puzzle.slice();r.solution=solution;r.difficulty=difficulty||r.difficulty;
+    r.startTime=Date.now();r.finished=false;r.winnerId=null;
+    for(const id of r.players.keys())r.scores[id]=0; emit(r);
+  });
+  s.on("disconnect",()=>{
+    const r=rooms.get(s.data.room); if(!r)return;
+    r.players.delete(s.id);delete r.scores[s.id];
+    if(!r.players.size){rooms.delete(r.code);return}
+    r.hostId=[...r.players.keys()][0];r.started=false;r.finished=false;r.puzzle=r.board=r.solution=null;r.startTime=null;
+    emit(r);
   });
 });
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Multiplayer Sudoku running on port ${PORT}`));
+server.listen(process.env.PORT||3000,()=>console.log("Sudoku Together v2 is running"));
